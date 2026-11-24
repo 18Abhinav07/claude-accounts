@@ -1,0 +1,170 @@
+#!/bin/bash
+# claude-account: switch the Claude desktop app between accounts.
+# Only the sign-in is swapped. Settings, MCP config, extensions, folders,
+# ~/.claude, and per-account session folders all stay in place.
+#
+#   claude-account list            saved accounts (* = signed in now)
+#   claude-account current         name of the signed-in account
+#   claude-account switch NAME     quit Claude, swap sign-in to NAME, reopen
+#   claude-account add NAME        quit Claude, park current sign-in, reopen signed out
+#   claude-account rename OLD NEW
+set -euo pipefail
+
+DATA="${CLAUDE_DATA:-$HOME/Library/Application Support/Claude}"
+STORE="${CLAUDE_ACCOUNTS:-$HOME/Library/Application Support/Claude-Accounts}"
+APP="/Applications/Claude.app"
+NO_APP="${CLAUDE_ACCOUNT_NO_APP:-0}"   # 1 = don't quit/launch (testing)
+
+# Sign-in lives in these files/folders plus a few keys in config.json.
+AUTH_PATHS=("Cookies" "Cookies-journal" "Local Storage" "Session Storage" "IndexedDB" "WebStorage")
+AUTH_KEYS='["oauth:tokenCache","oauth:tokenCacheV2","lastKnownAccountUuid"]'
+
+ACCTS="$STORE/accounts"; BACKUPS="$STORE/backups"; CUR="$STORE/current"
+mkdir -p "$ACCTS" "$BACKUPS"
+
+die() { echo "claude-account: $*" >&2; exit 1; }
+valid() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "account names use letters, numbers, . _ - only"; }
+current() { [[ -f "$CUR" ]] && cat "$CUR" || true; }
+
+BUNDLE_ID="com.anthropic.claudefordesktop"
+
+# Claude as macOS sees it (the real, running app).
+live_pids() {
+  osascript -e "tell application \"System Events\" to get unix id of every process whose bundle identifier is \"$BUNDLE_ID\"" 2>/dev/null | tr -d ' ' | tr ',' '\n' | grep -E '^[0-9]+$' || true
+}
+# Every Claude main process, including stuck leftovers that already quit.
+all_pids() { pgrep -U "$(id -u)" -f "^$APP/Contents/MacOS/Claude( |\$)" 2>/dev/null || true; }
+holds_data() { lsof -p "$1" 2>/dev/null | grep -qF "$DATA/"; }
+
+LOG="$HOME/Library/Logs/Claude/main.log"
+log_lines() { [[ -f "$LOG" ]] && wc -l < "$LOG" | tr -d ' ' || echo 0; }
+# Did Claude log a finished, clean shutdown after line $1?
+quit_logged() { [[ -f "$LOG" ]] && tail -n "+$(( $1 + 1 ))" "$LOG" | grep -q "willQuit: handler is ready for quit"; }
+
+stop_pids() {  # $@ = pids: ask, wait, then force
+  [[ $# -eq 0 ]] && return 0
+  kill -TERM "$@" 2>/dev/null || true
+  for _ in $(seq 1 10); do local alive=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done; [[ $alive == 0 ]] && return 0; sleep 0.5; done
+  kill -KILL "$@" 2>/dev/null || true; sleep 1
+}
+
+quit_app() {
+  [[ "$NO_APP" == 1 ]] && return 0
+  local start; start="$(log_lines)"
+  if [[ -n "$(live_pids)" ]]; then
+    osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+    local ok=0
+    for _ in $(seq 1 90); do [[ -z "$(live_pids)" ]] && { ok=1; break; }; sleep 0.5; done
+    [[ $ok == 1 ]] || die "Claude didn't quit within 45s (a dialog in Claude may be asking something). Nothing was changed."
+  fi
+
+  # Stuck leftovers that hold no data files: just close them.
+  local idle=(); for p in $(all_pids); do holds_data "$p" || idle+=("$p"); done
+  stop_pids "${idle[@]+"${idle[@]}"}"
+
+  # Give the quitting app up to 20s to exit by itself.
+  for _ in $(seq 1 40); do [[ -z "$(all_pids)" ]] && return 0; sleep 0.5; done
+
+  # Still there. Only force it if Claude logged that its shutdown finished
+  # (its data is saved by then); otherwise leave everything alone.
+  if quit_logged "$start"; then
+    stop_pids $(all_pids)
+    [[ -z "$(all_pids)" ]] && return 0
+  fi
+  die "A Claude process is still running and using its data files. Quit Claude (Cmd+Q), wait a few seconds, and try again. Nothing was changed."
+}
+
+launch_app() { [[ "$NO_APP" == 1 ]] && return 0; open -a "$APP"; }
+
+# Copy the live sign-in into $1 (a directory).
+save_auth() {
+  local dest="$1"; rm -rf "$dest"; mkdir -p "$dest/files"
+  for p in "${AUTH_PATHS[@]}"; do [[ -e "$DATA/$p" ]] && cp -Rp "$DATA/$p" "$dest/files/"; done
+  /usr/bin/python3 - "$DATA/config.json" "$dest/keys.json" "$AUTH_KEYS" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1])) if __import__('os').path.exists(sys.argv[1]) else {}
+keys = json.loads(sys.argv[3])
+json.dump({k: cfg[k] for k in keys if k in cfg}, open(sys.argv[2], "w"))
+PY
+  chmod -R go-rwx "$dest"
+}
+
+# Remove the live sign-in (leaves everything else alone).
+clear_auth() {
+  for p in "${AUTH_PATHS[@]}"; do rm -rf "$DATA/$p"; done
+  /usr/bin/python3 - "$DATA/config.json" "$AUTH_KEYS" <<'PY'
+import json, sys, os
+path, keys = sys.argv[1], json.loads(sys.argv[2])
+if os.path.exists(path):
+    cfg = json.load(open(path))
+    for k in keys: cfg.pop(k, None)
+    tmp = path + ".tmp"; json.dump(cfg, open(tmp, "w"), indent=2); os.replace(tmp, path)
+PY
+}
+
+# Put a saved sign-in from $1 back in place.
+restore_auth() {
+  local src="$1"; clear_auth
+  for p in "${AUTH_PATHS[@]}"; do [[ -e "$src/files/$p" ]] && cp -Rp "$src/files/$p" "$DATA/"; done
+  /usr/bin/python3 - "$DATA/config.json" "$src/keys.json" <<'PY'
+import json, sys, os
+path = sys.argv[1]
+cfg = json.load(open(path)) if os.path.exists(path) else {}
+cfg.update(json.load(open(sys.argv[2])))
+tmp = path + ".tmp"; json.dump(cfg, open(tmp, "w"), indent=2); os.replace(tmp, path)
+PY
+}
+
+backup() {
+  local b="$BACKUPS/$(date +%Y%m%d-%H%M%S)"; save_auth "$b"
+  cp -p "$DATA/config.json" "$b/config.json" 2>/dev/null || true
+  local all; all=$(ls -1d "$BACKUPS"/*/ 2>/dev/null | sort)
+  local extra=$(( $(printf '%s\n' "$all" | grep -c . ) - 10 ))
+  (( extra > 0 )) && printf '%s\n' "$all" | head -n "$extra" | while read -r old; do rm -rf "$old"; done || true
+}
+
+# Park whatever is signed in now under the current name.
+park_current() {
+  local c; c="$(current)"
+  if [[ -n "$c" ]]; then save_auth "$ACCTS/$c"
+  elif /usr/bin/python3 -c "import json,sys;sys.exit(0 if 'oauth:tokenCacheV2' in json.load(open(sys.argv[1])) or 'oauth:tokenCache' in json.load(open(sys.argv[1])) else 1)" "$DATA/config.json" 2>/dev/null; then
+    die "Claude is signed in but no account name is recorded. Run: claude-account adopt NAME"
+  fi
+}
+
+cmd="${1:-list}"; shift || true
+case "$cmd" in
+  list)
+    c="$(current)"
+    for d in "$ACCTS"/*/; do [[ -d "$d" ]] || continue; n="$(basename "$d")"; [[ "$n" == "$c" ]] && echo "* $n" || echo "  $n"; done
+    [[ -n "$c" && ! -d "$ACCTS/$c" ]] && echo "* $c" || true ;;
+  current) current ;;
+  status)
+    /usr/bin/python3 - "$ACCTS" "$(current)" "$DATA/config.json" <<'PY2'
+import json, os, sys
+accts, cur, cfg = sys.argv[1], sys.argv[2], sys.argv[3]
+try: signed = any(k.startswith("oauth:tokenCache") for k in json.load(open(cfg)))
+except Exception: signed = False
+names = sorted(d for d in os.listdir(accts) if os.path.isdir(os.path.join(accts, d))) if os.path.isdir(accts) else []
+if cur and cur not in names: names.append(cur)
+out = [{"name": n, "current": n == cur,
+        "lastUsed": (os.path.getmtime(os.path.join(accts, n)) if os.path.isdir(os.path.join(accts, n)) else None)} for n in names]
+print(json.dumps({"current": cur or None, "signedIn": signed, "accounts": out}))
+PY2
+    ;;
+  adopt)   # name the account that is signed in right now
+    n="${1:?name}"; valid "$n"; echo "$n" > "$CUR"; echo "Current sign-in is now called '$n'." ;;
+  switch)
+    n="${1:?name}"; valid "$n"; [[ "$n" == "$(current)" ]] && { echo "Already on '$n'."; launch_app; exit 0; }
+    [[ -d "$ACCTS/$n" ]] || die "no saved account '$n' (use: add $n)"
+    echo "STEP:closing"; quit_app; echo "STEP:swapping"; backup; park_current; restore_auth "$ACCTS/$n"; echo "$n" > "$CUR"
+    echo "Switched to '$n'."; echo "STEP:opening"; launch_app; echo "STEP:done" ;;
+  add)
+    n="${1:?name}"; valid "$n"; [[ -d "$ACCTS/$n" ]] && die "'$n' already exists (use: switch $n)"
+    echo "STEP:closing"; quit_app; echo "STEP:swapping"; backup; park_current; clear_auth; echo "$n" > "$CUR"
+    echo "Signed out. Sign in to '$n' in the Claude window."; echo "STEP:opening"; launch_app; echo "STEP:done" ;;
+  rename)
+    o="${1:?old}"; n="${2:?new}"; valid "$n"; [[ -e "$ACCTS/$n" ]] && die "'$n' exists"
+    [[ -d "$ACCTS/$o" ]] && mv "$ACCTS/$o" "$ACCTS/$n"; [[ "$(current)" == "$o" ]] && echo "$n" > "$CUR"; echo "Renamed." ;;
+  *) sed -n '2,12p' "$0"; exit 1 ;;
+esac
